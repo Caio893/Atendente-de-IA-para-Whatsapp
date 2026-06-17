@@ -1,4 +1,20 @@
-# Atendente de IA para WhatsApp
+<h1 align="left">Atendente de IA para WhatsApp / Forte Lajes</h1>
+
+<p align="left">
+  <img alt="Node.js 20" src="https://img.shields.io/badge/NODE.JS-20-339933?style=for-the-badge&logo=nodedotjs&logoColor=white">
+  <img alt="WhatsApp Web" src="https://img.shields.io/badge/WHATSAPP-WEB-25D366?style=for-the-badge&logo=whatsapp&logoColor=white">
+  <img alt="OpenAI API" src="https://img.shields.io/badge/OPENAI-API-111111?style=for-the-badge&logo=openai&logoColor=white">
+  <img alt="SQLite" src="https://img.shields.io/badge/SQLITE-PERSISTENCIA-003B57?style=for-the-badge&logo=sqlite&logoColor=white">
+  <img alt="Docker" src="https://img.shields.io/badge/DOCKER-DEPLOY-2496ED?style=for-the-badge&logo=docker&logoColor=white">
+</p>
+
+<p align="left">
+  <img alt="JavaScript" src="https://img.shields.io/badge/JS-JAVASCRIPT-F7DF1E?style=for-the-badge&logo=javascript&logoColor=111111">
+  <img alt="Whisper CPP" src="https://img.shields.io/badge/WHISPER.CPP-AUDIO%20IA-FF4F9A?style=for-the-badge">
+  <img alt="FFmpeg" src="https://img.shields.io/badge/FFMPEG-TRANSCRICAO-007808?style=for-the-badge&logo=ffmpeg&logoColor=white">
+  <img alt="Node Cron" src="https://img.shields.io/badge/NODE--CRON-LEMBRETES-FFCA28?style=for-the-badge">
+  <img alt="Production Ready" src="https://img.shields.io/badge/STATUS-PRODUCTION%20READY-2ECC71?style=for-the-badge">
+</p>
 
 Bot de atendimento para WhatsApp que coleta pedidos de visita tecnica/orcamento, organiza os dados do cliente, registra os agendamentos em SQLite e envia lembretes administrativos diarios.
 
