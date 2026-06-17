@@ -3,11 +3,10 @@
 .env
 .env.*
 !.env.example
+github_pat*
 key
 key.pub
-github_pat_*
 key-*
-*.pub
 *.pem
 *.key
 id_*
@@ -15,6 +14,10 @@ id_*
 .wwebjs_cache
 data/*
 !data/.gitkeep
+bin/*
+!bin/.gitkeep
+models/*
+!models/.gitkeep
 media/*
 !media/.gitkeep
 node_modules

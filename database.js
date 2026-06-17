@@ -86,10 +86,10 @@ class AppDatabase {
     }
   }
 
-  createVisit({ clientName, clientPhone, address, neighborhood, visitDate, visitTime }) {
+  createVisit({ clientName, clientPhone, address, neighborhood, visitDate, visitTime, notes }) {
     const statement = this.db.prepare(`
-      INSERT INTO visits (client_name, client_phone, address, neighborhood, visit_date, visit_time, status)
-      VALUES (@clientName, @clientPhone, @address, @neighborhood, @visitDate, @visitTime, 'pending')
+      INSERT INTO visits (client_name, client_phone, address, neighborhood, visit_date, visit_time, notes, status)
+      VALUES (@clientName, @clientPhone, @address, @neighborhood, @visitDate, @visitTime, @notes, 'pending')
     `);
 
     const result = statement.run({
@@ -98,7 +98,8 @@ class AppDatabase {
       address: address || neighborhood || 'A combinar por mensagem',
       neighborhood: neighborhood || address || 'A combinar por mensagem',
       visitDate,
-      visitTime: visitTime || 'A combinar'
+      visitTime: visitTime || 'A combinar',
+      notes: notes || ''
     });
     return this.getVisitById(result.lastInsertRowid);
   }

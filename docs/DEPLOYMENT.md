@@ -1,113 +1,83 @@
-# Deployment Notes
+# Deployment
 
-This project is ready for Docker deployment on a Linux VPS. It reads secrets from `.env`, persists runtime data through Docker volumes and exposes a lightweight health endpoint on `/health`.
+Este guia descreve um deploy generico em VPS com Docker. Nao coloque IP real, tokens, chaves, `.env`, sessoes do WhatsApp ou banco de dados no repositorio publico.
 
-No real server IP, token, key or WhatsApp session is included in this public copy.
-
-## VPS Target Template
-
-```text
-IP: YOUR_SERVER_IP
-OS: Ubuntu 24.04 or compatible Linux distribution
-Port: 3001
-```
-
-## First-Time VPS Setup
-
-Install Docker and Git:
+## Preparar ambiente
 
 ```bash
 sudo apt update
 sudo apt install -y git ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo tee /etc/apt/keyrings/docker.asc > /dev/null
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker "$USER"
 ```
 
-Log out and back in after `usermod`, or run Docker commands with `sudo`.
+Instale Docker conforme a documentacao oficial da Docker para a sua distribuicao Linux.
 
-## Clone And Configure
+## Clonar o projeto
 
 ```bash
-sudo mkdir -p /opt/whatsapp-scheduling
-sudo chown "$USER":"$USER" /opt/whatsapp-scheduling
-cd /opt/whatsapp-scheduling
-git clone https://github.com/YOUR_GITHUB_USER/whatsapp-visit-scheduler-bot.git .
+sudo mkdir -p /opt/atendente-ia-whatsapp
+sudo chown "$USER":"$USER" /opt/atendente-ia-whatsapp
+cd /opt/atendente-ia-whatsapp
+git clone git@github.com:Caio893/Atendente-de-IA-para-Whatsapp.git .
+```
+
+## Configurar variaveis
+
+```bash
 cp .env.example .env
 nano .env
 ```
 
-Set at least:
+Preencha os valores reais apenas no servidor:
 
 ```bash
-HOST=0.0.0.0
-PORT=3001
-OPENAI_API_KEY=your_real_openai_api_key
+OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4o-mini
-ADMIN_PHONE_NUMBER=5511987654321
-MARK_BOT_REPLIES_UNREAD=true
+ADMIN_PHONE_NUMBER=5511999999999
+PORT=3001
 ```
 
-If you want to send an institutional video in the welcome flow, place it on the host at:
+## Pastas persistentes
 
 ```bash
-/opt/whatsapp-scheduling/media/company-presentation.mp4
+mkdir -p data media .wwebjs_auth models bin
 ```
 
-Keep this value in `.env`:
+- `data`: banco SQLite.
+- `.wwebjs_auth`: sessao local do WhatsApp.
+- `media`: midias opcionais usadas pelo bot.
+- `models`: modelos do Whisper.
+- `bin`: binarios auxiliares, como `whisper-cli`.
 
-```bash
-FACTORY_VIDEO_PATH=/app/media/company-presentation.mp4
-```
+Essas pastas nao devem receber arquivos reais no Git.
 
-## Docker Commands
-
-Build and start:
+## Subir o container
 
 ```bash
 docker compose up -d --build
-```
-
-Follow logs and scan the QR code:
-
-```bash
 docker compose logs -f whatsapp-bot
 ```
 
-Health check:
+Escaneie o QR code exibido nos logs na primeira execucao.
+
+## Healthcheck
 
 ```bash
 curl http://127.0.0.1:3001/health
 ```
 
-Restart:
+## Atualizar deploy
 
 ```bash
-docker compose restart whatsapp-bot
-```
-
-Stop:
-
-```bash
-docker compose down
-```
-
-## Future Updates
-
-```bash
-cd /opt/whatsapp-scheduling
+cd /opt/atendente-ia-whatsapp
 git pull --ff-only
 docker compose up -d --build
 docker compose logs -f whatsapp-bot
 ```
 
-## Secrets Checklist
+## Checklist de seguranca
 
-- Keep the real OpenAI key only in `.env` on your machine or VPS.
-- Commit `.env.example`, never `.env`.
-- Keep `.wwebjs_auth`, SQLite files, logs, caches, tokens, passwords and runtime media out of Git.
-- Rotate any key that was ever pasted into GitHub, chat, logs or screenshots.
+- Commitar `.env.example`, nunca `.env`.
+- Nao commitar `.wwebjs_auth`.
+- Nao commitar `data/database.sqlite`.
+- Nao commitar tokens, senhas, chaves privadas ou arquivos de credenciais.
+- Revogar e recriar qualquer credencial que tenha sido exposta em Git, logs, prints ou mensagens.

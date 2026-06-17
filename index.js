@@ -10,9 +10,14 @@ const {
   isChromiumProfileLockError
 } = require('./chromiumProfile');
 const { AppDatabase } = require('./database');
+const {
+  getAudioTranscriptionInfo,
+  transcribeWhatsAppAudio
+} = require('./audioTranscription');
 const { startCronJobs } = require('./cronJobs');
 const {
   FACTORY_VIDEO_SENT_EVENT,
+  hasSchedulingIntent,
   parseVisitDay,
   SessionManager
 } = require('./sessionManager');
@@ -39,6 +44,16 @@ const customerFollowUpReplyDelayMs = parseNonNegativeInteger(
   process.env.CUSTOMER_FOLLOW_UP_REPLY_DELAY_MS,
   Math.max(0, customerReplyDelayMs - 5000)
 );
+const startedAt = new Date().toISOString();
+const DEFAULT_FACTORY_VIDEO_CAPTION = [
+  'Apresentamos a fábrica da Forte Lajes.',
+  '',
+  'Trabalhamos com treliças ArcelorMittal ou Gerdau, duas das marcas mais reconhecidas do mercado.',
+  '',
+  'Nossas vigas já são fabricadas e ficam disponíveis para entrega, com controle de qualidade em todas as etapas. Também utilizamos isopor de excelente qualidade, reduzindo riscos na substituição dos antigos tijolos e contribuindo para uma obra mais leve, confortável, elegante e ecologicamente correta.',
+  '',
+  'Nosso traço de fabricação utiliza concreto FCK 30.'
+].join('\n');
 
 const config = {
   serviceHost: process.env.HOST || '0.0.0.0',
@@ -59,23 +74,56 @@ const config = {
   customerReplyDelayMs,
   customerFollowUpReplyDelayMs,
   factoryVideoPath: process.env.FACTORY_VIDEO_PATH || '',
-  factoryVideoCaption: process.env.FACTORY_VIDEO_CAPTION || 'Vídeo de apresentação da nossa fábrica.',
-  markBotRepliesUnread: process.env.MARK_BOT_REPLIES_UNREAD !== 'false'
+  factoryVideoCaption: parseMultilineEnv(process.env.FACTORY_VIDEO_CAPTION, DEFAULT_FACTORY_VIDEO_CAPTION),
+  markBotRepliesUnread: process.env.MARK_BOT_REPLIES_UNREAD !== 'false',
+  humanTakeoverSuppressionMs: parseNonNegativeInteger(process.env.HUMAN_TAKEOVER_SUPPRESSION_MS, 5 * 60 * 1000),
+  customerAiAssistantEnabled: process.env.CUSTOMER_AI_ASSISTANT_ENABLED !== 'false',
+  botLoopWindowMs: parsePositiveInteger(process.env.BOT_LOOP_WINDOW_MS, 10 * 60 * 1000),
+  botLoopMaxAutoReplies: parsePositiveInteger(process.env.BOT_LOOP_MAX_AUTO_REPLIES, 6),
+  maxFactoryVideoBytes: parseNonNegativeInteger(process.env.MAX_FACTORY_VIDEO_BYTES, 20 * 1024 * 1024),
+  maxPendingCustomers: parsePositiveInteger(process.env.MAX_PENDING_CUSTOMERS, 100),
+  maxQueuedMessagesPerCustomer: parsePositiveInteger(process.env.MAX_QUEUED_MESSAGES_PER_CUSTOMER, 10),
+  maxQueuedMessageChars: parsePositiveInteger(process.env.MAX_QUEUED_MESSAGE_CHARS, 4000),
+  whatsappOperationTimeoutMs: parsePositiveInteger(process.env.WHATSAPP_OPERATION_TIMEOUT_MS, 45000),
+  whatsappWatchdogIntervalMs: parsePositiveInteger(process.env.WHATSAPP_WATCHDOG_INTERVAL_MS, 60000),
+  whatsappWatchdogTimeoutMs: parsePositiveInteger(process.env.WHATSAPP_WATCHDOG_TIMEOUT_MS, 15000),
+  whatsappWatchdogMaxFailures: parsePositiveInteger(process.env.WHATSAPP_WATCHDOG_MAX_FAILURES, 3),
+  sessionCacheMaxEntries: parsePositiveInteger(process.env.MAX_SESSION_CACHE_ENTRIES, 1000),
+  sessionCacheTtlMs: parsePositiveInteger(process.env.SESSION_CACHE_TTL_MS, 24 * 60 * 60 * 1000)
 };
 
 const database = new AppDatabase(config.sqliteDbPath);
 database.init();
 
 const sessionManager = new SessionManager(database, {
-  timezone: config.cronTimezone
+  timezone: config.cronTimezone,
+  customerAssistantEnabled: config.customerAiAssistantEnabled,
+  maxCacheEntries: config.sessionCacheMaxEntries,
+  cacheTtlMs: config.sessionCacheTtlMs
 });
 
 let cronController = null;
 let healthServer = null;
 let adminChatId = config.adminChatIdCandidate;
+let whatsappReady = false;
+let whatsappWatchdogTimer = null;
+let whatsappWatchdogFailures = 0;
 const botOutgoingMessages = [];
 const processedAdminCommandMessageIds = new Set();
 const pendingCustomerMessages = new Map();
+const humanTakeoverSuppressions = new Map();
+const automaticReplyHistory = new Map();
+const AUDIO_TRANSCRIPTION_FAILURE_REPLY = 'Tive um problema ao transcrever seu audio. Pode tentar enviar novamente em instantes?';
+
+class AudioTranscriptionRequiredError extends Error {
+  constructor(reason, skipped) {
+    super(`Audio transcription failed: ${reason || 'unknown'}`);
+    this.name = 'AudioTranscriptionRequiredError';
+    this.code = 'AUDIO_TRANSCRIPTION_REQUIRED';
+    this.reason = reason || 'unknown';
+    this.skipped = Boolean(skipped);
+  }
+}
 
 const client = new Client({
   authStrategy: new LocalAuth({
@@ -111,6 +159,9 @@ client.on('auth_failure', (message) => {
 
 client.on('ready', async () => {
   logger.info('WhatsApp client is ready');
+  whatsappReady = true;
+  whatsappWatchdogFailures = 0;
+  startWhatsAppWatchdog();
 
   if (!cronController) {
     adminChatId = await resolveAdminChatId();
@@ -129,6 +180,7 @@ client.on('ready', async () => {
 });
 
 client.on('disconnected', (reason) => {
+  whatsappReady = false;
   logger.warn('WhatsApp disconnected; exiting so Docker can restart cleanly', { reason });
   setTimeout(() => process.exit(1), 5000);
 });
@@ -153,12 +205,12 @@ client.on('message', async (message) => {
         const customerPhone = await resolveCustomerPhone(message);
         if (isIgnoredContact(customerPhone)) return;
 
-        await safeReply(message, 'Esse comando é exclusivo da equipe comercial.');
+        await safeReply(message, 'Esse comando é exclusivo da equipe da Forte Lajes.');
         return;
       }
     }
 
-    if (message.fromMe || isGroupMessage(message.from)) return;
+    if (message.fromMe || isGroupMessage(message.from) || isSystemBroadcastMessage(message)) return;
 
     if (isAdmin(message.from)) {
       if (!body) return;
@@ -233,9 +285,23 @@ client.on('message_create', async (message) => {
     if (!clientPhone) return;
     if (isIgnoredContact(clientPhone)) return;
 
+    const suppressedHumanTakeover = consumeHumanTakeoverSuppression([
+      clientPhone,
+      targetChatId
+    ]);
+    if (suppressedHumanTakeover) {
+      logger.info('Human takeover pause skipped after admin reactivation', {
+        clientPhone,
+        chatId: targetChatId,
+        suppressionReason: suppressedHumanTakeover.reason
+      });
+      return;
+    }
+
     database.pauseAutomation(clientPhone, 'human_takeover');
     sessionManager.clearSession(clientPhone);
     clearPendingCustomerReply(clientPhone);
+    clearAutomaticReplyHistory(clientPhone);
 
     logger.info('Automation paused for customer after human employee reply', {
       clientPhone,
@@ -301,6 +367,8 @@ async function handleAdminMessage(message, body) {
     sessionManager.clearSessions(resetKeys);
     const clearedPendingReplies = clearPendingCustomerReply(resetKeys);
     const clearedOutgoingMemory = clearBotOutgoingMemory(resetKeys);
+    const clearedAutomaticReplyHistory = clearAutomaticReplyHistory(resetKeys);
+    const suppressedHumanTakeoverKeys = suppressNextHumanTakeover(resetKeys, 'admin_reset');
     const remainingState = summarizeRemainingContactState(resetResult.remainingState);
     const matchingContactFound = Boolean(matchingVisit) || didResetDeleteAnyState(resetResult);
     logAdminPhoneMatch('!reset', phoneResult.original, normalizedClientPhone, matchingContactFound);
@@ -315,6 +383,8 @@ async function handleAdminMessage(message, body) {
       deletedContactEvents: resetResult.deletedContactEvents,
       clearedPendingReplies,
       clearedOutgoingMemory,
+      clearedAutomaticReplyHistory,
+      suppressedHumanTakeoverKeys,
       remainingState
     });
 
@@ -346,9 +416,17 @@ async function handleAdminMessage(message, body) {
     const currentDateKey = getDateKeyInTimezone(getMessageDate(message), config.cronTimezone);
     const visit = database.findVisitByPhone(resetKeys, currentDateKey);
     logAdminPhoneMatch('!reativar', phoneResult.original, clientPhone, Boolean(visit));
+    const clearedAutomationRows = clearAutomationState(resetKeys);
     database.reactivateAutomation(clientPhone, 'admin_reactivated');
     sessionManager.clearSessions(resetKeys);
     clearPendingCustomerReply(resetKeys);
+    clearAutomaticReplyHistory(resetKeys);
+    const suppressedHumanTakeoverKeys = suppressNextHumanTakeover(resetKeys, 'admin_reactivated');
+    logger.info('Contact reactivated by admin command', {
+      clientPhone,
+      clearedAutomationRows,
+      suppressedHumanTakeoverKeys
+    });
     await message.reply(`Atendimento automático reativado para ${clientPhone}.`);
     return;
   }
@@ -368,6 +446,7 @@ async function handleAdminMessage(message, body) {
     database.pauseAutomation(clientPhone, 'admin_paused');
     sessionManager.clearSessions(resetKeys);
     clearPendingCustomerReply(resetKeys);
+    clearAutomaticReplyHistory(resetKeys);
     await message.reply(`Atendimento automático pausado para ${clientPhone}.`);
     return;
   }
@@ -533,6 +612,7 @@ async function handleIgnoreCommand(message, body) {
   sessionManager.clearSessions(resetKeys);
   const clearedPendingReplies = clearPendingCustomerReply(resetKeys);
   clearBotOutgoingMemory(resetKeys);
+  clearAutomaticReplyHistory(resetKeys);
 
   logger.info('Contact ignored by admin command', {
     clientPhone,
@@ -554,13 +634,18 @@ async function handleUnignoreCommand(message, body) {
   const currentDateKey = getDateKeyInTimezone(getMessageDate(message), config.cronTimezone);
   const visit = database.findVisitByPhone(resetKeys, currentDateKey);
   logAdminPhoneMatch('!designorar', phoneResult.original, clientPhone, Boolean(visit));
+  const clearedAutomationRows = clearAutomationState(resetKeys);
   database.reactivateAutomation(clientPhone, 'admin_unignored');
   sessionManager.clearSessions(resetKeys);
   clearPendingCustomerReply(resetKeys);
   clearBotOutgoingMemory(resetKeys);
+  clearAutomaticReplyHistory(resetKeys);
+  const suppressedHumanTakeoverKeys = suppressNextHumanTakeover(resetKeys, 'admin_unignored');
 
   logger.info('Contact unignored by admin command', {
-    clientPhone
+    clientPhone,
+    clearedAutomationRows,
+    suppressedHumanTakeoverKeys
   });
 
   await message.reply(`Contato ${formatBrazilianPhoneNumber(clientPhone)} deixou de ser ignorado pelo bot.`);
@@ -708,6 +793,16 @@ function summarizeRemainingContactState(remainingState = {}) {
     .filter(([, counts]) => counts.sessions || counts.automation || counts.contactEvents));
 }
 
+function clearAutomationState(keys) {
+  let deletedAutomationRows = 0;
+
+  for (const key of keys) {
+    deletedAutomationRows += database.deleteAutomationState(key);
+  }
+
+  return deletedAutomationRows;
+}
+
 function getAdminChatIdCandidateFromMessage(message) {
   const candidate = getAdminContactCandidates(message).find((contact) => isAdmin(contact));
   if (!candidate) return '';
@@ -800,6 +895,16 @@ function markAdminCommandProcessed(message) {
 function queueCustomerMessage({ message, customerPhone, body, receivedAt, mediaType }) {
   const key = getCustomerQueueKey({ from: message.from, customerPhone });
   const existing = pendingCustomerMessages.get(key);
+
+  if (!existing && pendingCustomerMessages.size >= config.maxPendingCustomers) {
+    logger.warn('Customer message queue is full; dropping incoming message', {
+      key,
+      maxPendingCustomers: config.maxPendingCustomers
+    });
+    safeReply(message, 'Estamos com alta demanda no atendimento automatico. Pode tentar novamente em instantes?');
+    return;
+  }
+
   const delayMs = existing ? existing.delayMs : getCustomerReplyDelayMs({
     from: message.from,
     customerPhone
@@ -812,18 +917,25 @@ function queueCustomerMessage({ message, customerPhone, body, receivedAt, mediaT
   const entry = existing || {
     from: message.from,
     customerPhone,
-    messages: []
+    messages: [],
+    lastMessage: null
   };
 
   entry.from = message.from;
   entry.customerPhone = customerPhone || entry.customerPhone;
   entry.delayMs = delayMs;
+  entry.lastMessage = message;
   entry.messages.push({
-    message,
-    body,
+    body: truncateForQueue(body),
     receivedAt,
-    mediaType
+    mediaType,
+    sourceMessage: mediaType === 'audio' ? message : null
   });
+
+  if (entry.messages.length > config.maxQueuedMessagesPerCustomer) {
+    entry.messages.splice(0, entry.messages.length - config.maxQueuedMessagesPerCustomer);
+  }
+
   entry.timer = setTimeout(() => {
     flushQueuedCustomerMessages(key).catch((error) => {
       logger.error('Failed to flush queued customer messages', {
@@ -838,6 +950,7 @@ function queueCustomerMessage({ message, customerPhone, body, receivedAt, mediaT
   logger.debug('Customer message queued', {
     key,
     messageCount: entry.messages.length,
+    pendingCustomers: pendingCustomerMessages.size,
     delayMs: entry.delayMs
   });
 }
@@ -849,32 +962,44 @@ async function flushQueuedCustomerMessages(key) {
   pendingCustomerMessages.delete(key);
 
   const lastItem = entry.messages[entry.messages.length - 1];
-  const combinedBody = entry.messages
+  const replyTarget = entry.lastMessage;
+  const preparedMessages = await prepareQueuedCustomerMessages(entry);
+  const combinedBody = preparedMessages
     .map((item) => String(item.body || '').trim())
     .filter(Boolean)
     .join('\n');
-  const hasAudio = entry.messages.some((item) => item.mediaType === 'audio');
+  const hasAudio = preparedMessages.some((item) => item.mediaType === 'audio');
+  const hasTranscribedAudio = preparedMessages.some((item) => item.transcribedAudio);
   const mediaType = combinedBody ? 'text' : (hasAudio ? 'audio' : 'text');
 
   try {
-    const result = sessionManager.handleIncomingMessage({
+    let result = await sessionManager.handleIncomingMessage({
       from: entry.from,
       customerPhone: entry.customerPhone,
       body: combinedBody,
       receivedAt: lastItem.receivedAt,
-      mediaType
+      mediaType,
+      transcribedAudio: hasTranscribedAudio
     });
 
     if (result.suppressed) return;
 
-    let sentAutomaticCustomerMessage = false;
-    const sentReply = await sendCustomerReply(lastItem.message, result.reply);
-    if (sentReply) sentAutomaticCustomerMessage = true;
+    if (hasTranscribedAudio) {
+      result = withTranscribedAudioReplyFallback(result, combinedBody);
+    }
 
+    if (shouldPauseForAutomaticLoop(entry, result)) {
+      return;
+    }
+
+    let sentAutomaticCustomerMessage = false;
     if (result.sendFactoryVideo) {
-      const sentVideo = await sendFactoryVideoForResult(lastItem.message, result);
+      const sentVideo = await sendFactoryVideoForResult(replyTarget, result);
       if (sentVideo) sentAutomaticCustomerMessage = true;
     }
+
+    const sentReply = await sendCustomerReply(replyTarget, result.reply);
+    if (sentReply) sentAutomaticCustomerMessage = true;
 
     if (result.completed && adminChatId) {
       await sendAdminMessage(formatNewVisitAlert(result.visit));
@@ -888,17 +1013,210 @@ async function flushQueuedCustomerMessages(key) {
     }
 
     if (sentAutomaticCustomerMessage) {
-      await markCustomerChatUnreadAfterBotReply(lastItem.message, 'automatic_bot_reply');
+      rememberAutomaticReply(entry);
+      await markCustomerChatUnreadAfterBotReply(replyTarget, 'automatic_bot_reply');
     }
   } catch (error) {
+    if (error && error.code === 'AUDIO_TRANSCRIPTION_REQUIRED') {
+      logger.error('Failed to process queued customer audio transcription', {
+        from: entry.from,
+        customerPhone: entry.customerPhone,
+        reason: error.reason,
+        skipped: error.skipped,
+        audioTranscription: getAudioTranscriptionLogInfo(),
+        error
+      });
+
+      await safeReply(replyTarget, AUDIO_TRANSCRIPTION_FAILURE_REPLY);
+      return;
+    }
+
     logger.error('Failed to process grouped customer messages', {
       from: entry.from,
       customerPhone: entry.customerPhone,
       error
     });
 
-    await safeReply(lastItem.message, 'Tive um problema ao processar sua mensagem. Pode tentar novamente em instantes?');
+    await safeReply(replyTarget, 'Tive um problema ao processar sua mensagem. Pode tentar novamente em instantes?');
   }
+}
+
+async function prepareQueuedCustomerMessages(entry) {
+  const shouldTranscribeAudio = shouldTranscribeQueuedAudio(entry);
+  const preparedMessages = [];
+
+  for (const item of entry.messages) {
+    if (item.mediaType !== 'audio' || !shouldTranscribeAudio) {
+      preparedMessages.push(item);
+      continue;
+    }
+
+    const transcription = await transcribeQueuedAudioItem(entry, item);
+    const body = [
+      String(item.body || '').trim(),
+      transcription
+    ].filter(Boolean).join('\n');
+
+    preparedMessages.push({
+      ...item,
+      body,
+      mediaType: 'text',
+      transcribedAudio: true,
+      sourceMessage: null
+    });
+  }
+
+  return preparedMessages;
+}
+
+function shouldTranscribeQueuedAudio(entry) {
+  if (!entry || !entry.messages.some((item) => item.mediaType === 'audio')) return false;
+  if (isIgnoredContact(entry.customerPhone)) return false;
+
+  return sessionManager.shouldTranscribeAudio({
+    from: entry.from,
+    customerPhone: entry.customerPhone
+  });
+}
+
+async function transcribeQueuedAudioItem(entry, item) {
+  const result = await transcribeWhatsAppAudio(item.sourceMessage);
+
+  if (result.ok) {
+    logger.info('Customer audio transcribed for automatic flow', {
+      from: entry.from,
+      customerPhone: entry.customerPhone,
+      transcriptChars: result.text.length
+    });
+    return result.text;
+  }
+
+  logger.warn('Customer audio could not be transcribed', {
+    from: entry.from,
+    customerPhone: entry.customerPhone,
+    reason: result.reason,
+    skipped: result.skipped,
+    audioTranscription: getAudioTranscriptionLogInfo()
+  });
+
+  throw new AudioTranscriptionRequiredError(result.reason, result.skipped);
+}
+
+function getAudioTranscriptionLogInfo() {
+  const info = getAudioTranscriptionInfo();
+  return {
+    enabled: info.enabled,
+    configured: info.configured,
+    provider: info.provider,
+    whisperBinaryPath: info.whisperBinaryPath,
+    whisperModelPath: info.whisperModelPath,
+    whisperLanguage: info.whisperLanguage,
+    ffmpegPath: info.ffmpegPath,
+    timeoutMs: info.timeoutMs,
+    maxAudioBytes: info.maxAudioBytes,
+    whisperThreads: info.whisperThreads,
+    ffmpegThreads: info.ffmpegThreads,
+    maxConcurrency: info.maxConcurrency,
+    maxQueue: info.maxQueue,
+    activeJobs: info.activeJobs,
+    queuedJobs: info.queuedJobs
+  };
+}
+
+function withTranscribedAudioReplyFallback(result, transcribedText) {
+  if (!result || result.suppressed) return result;
+
+  const currentReply = String(result.reply || '').trim();
+  if (currentReply) return result;
+
+  const fallbackReply = hasSchedulingIntent(transcribedText)
+    ? 'Para agendar a visita técnica, pode me informar seu nome?'
+    : 'Como posso ajudar? Se quiser agendar uma visita técnica, me envie seu nome, melhor dia, horário ou período preferido e o bairro ou endereço da obra.';
+
+  return {
+    ...result,
+    reply: fallbackReply
+  };
+}
+
+function shouldPauseForAutomaticLoop(entry, result) {
+  if (!result || result.suppressed) return false;
+  if (!result.reply && !result.sendFactoryVideo) return false;
+
+  const historyKey = getAutomaticReplyHistoryKey(entry);
+  if (!historyKey || config.botLoopMaxAutoReplies <= 0 || config.botLoopWindowMs <= 0) return false;
+
+  const now = Date.now();
+  const history = getRecentAutomaticReplyHistory(historyKey, now);
+  if (history.length < config.botLoopMaxAutoReplies) return false;
+
+  const stateKey = normalizeBrazilianPhoneDigits(entry.customerPhone) || getFallbackSessionKey(entry.from);
+  database.pauseAutomation(stateKey, 'bot_loop_detected');
+  sessionManager.clearSession(stateKey);
+  clearPendingCustomerReply([entry.customerPhone, entry.from, stateKey]);
+  automaticReplyHistory.delete(historyKey);
+
+  logger.warn('Automation paused to prevent automatic bot conversation loop', {
+    from: entry.from,
+    customerPhone: entry.customerPhone,
+    stateKey,
+    automaticRepliesInWindow: history.length,
+    windowMs: config.botLoopWindowMs,
+    maxAutoReplies: config.botLoopMaxAutoReplies
+  });
+
+  notifyAdminBotLoopPaused(entry, stateKey, history.length).catch((error) => {
+    logger.warn('Failed to notify admin about bot loop prevention', { error });
+  });
+
+  return true;
+}
+
+function rememberAutomaticReply(entry) {
+  const historyKey = getAutomaticReplyHistoryKey(entry);
+  if (!historyKey || config.botLoopWindowMs <= 0) return;
+
+  const now = Date.now();
+  const history = getRecentAutomaticReplyHistory(historyKey, now);
+  history.push(now);
+  automaticReplyHistory.set(historyKey, history);
+}
+
+function getRecentAutomaticReplyHistory(historyKey, now = Date.now()) {
+  const cutoff = now - config.botLoopWindowMs;
+  const history = (automaticReplyHistory.get(historyKey) || []).filter((timestamp) => timestamp >= cutoff);
+  automaticReplyHistory.set(historyKey, history);
+  return history;
+}
+
+function getAutomaticReplyHistoryKey(entry) {
+  return normalizeBrazilianPhoneDigits(entry && entry.customerPhone) || String(entry && entry.from || '');
+}
+
+async function notifyAdminBotLoopPaused(entry, stateKey, automaticRepliesInWindow) {
+  if (!adminChatId) return;
+
+  await sendAdminMessage([
+    'Atendimento automático pausado para evitar loop entre bots.',
+    '',
+    `Contato: ${formatBrazilianPhoneNumber(entry.customerPhone || stateKey)}`,
+    `Chat: ${entry.from || 'não identificado'}`,
+    `Respostas automáticas na janela: ${automaticRepliesInWindow}`,
+    '',
+    'Use !reset ou !reativar para liberar esse contato novamente se for um cliente real.'
+  ].join('\n'));
+}
+
+function truncateForQueue(value) {
+  const text = String(value || '');
+  if (text.length <= config.maxQueuedMessageChars) return text;
+
+  logger.warn('Incoming message body truncated before queueing', {
+    originalLength: text.length,
+    maxQueuedMessageChars: config.maxQueuedMessageChars
+  });
+
+  return text.slice(0, config.maxQueuedMessageChars);
 }
 
 function clearPendingCustomerReply(clientPhoneOrChatId) {
@@ -956,6 +1274,95 @@ function clearBotOutgoingMemory(clientPhoneOrChatId) {
   return clearedCount;
 }
 
+function clearAutomaticReplyHistory(clientPhoneOrChatId) {
+  const keys = buildContactStateKeySet(clientPhoneOrChatId);
+  let clearedCount = 0;
+
+  for (const key of keys) {
+    if (automaticReplyHistory.delete(key)) {
+      clearedCount += 1;
+    }
+  }
+
+  if (clearedCount > 0) {
+    logger.info('Automatic reply loop history cleared for contact', {
+      clearedCount
+    });
+  }
+
+  return clearedCount;
+}
+
+function suppressNextHumanTakeover(clientPhoneOrChatId, reason) {
+  if (config.humanTakeoverSuppressionMs <= 0) return 0;
+
+  const keys = buildContactStateKeySet(clientPhoneOrChatId);
+  const expiresAt = Date.now() + config.humanTakeoverSuppressionMs;
+
+  for (const key of keys) {
+    humanTakeoverSuppressions.set(key, {
+      reason,
+      expiresAt
+    });
+  }
+
+  if (keys.size > 0) {
+    logger.info('Temporary human takeover suppression registered', {
+      reason,
+      keyCount: keys.size,
+      expiresInMs: config.humanTakeoverSuppressionMs
+    });
+  }
+
+  return keys.size;
+}
+
+function consumeHumanTakeoverSuppression(clientPhoneOrChatId) {
+  pruneHumanTakeoverSuppressions();
+
+  const keys = buildContactStateKeySet(clientPhoneOrChatId);
+  let matchedSuppression = null;
+
+  for (const key of keys) {
+    const suppression = humanTakeoverSuppressions.get(key);
+    if (!suppression) continue;
+
+    matchedSuppression = suppression;
+    break;
+  }
+
+  if (!matchedSuppression) return null;
+
+  for (const key of keys) {
+    humanTakeoverSuppressions.delete(key);
+  }
+
+  return matchedSuppression;
+}
+
+function pruneHumanTakeoverSuppressions() {
+  const now = Date.now();
+
+  for (const [key, suppression] of humanTakeoverSuppressions.entries()) {
+    if (suppression.expiresAt <= now) {
+      humanTakeoverSuppressions.delete(key);
+    }
+  }
+}
+
+function buildContactStateKeySet(clientPhoneOrChatId) {
+  const inputs = Array.isArray(clientPhoneOrChatId) ? clientPhoneOrChatId : [clientPhoneOrChatId];
+  const keys = new Set();
+
+  for (const input of inputs) {
+    for (const key of buildContactStateKeys(input)) {
+      keys.add(key);
+    }
+  }
+
+  return keys;
+}
+
 function getCustomerQueueKey({ from, customerPhone }) {
   return normalizeBrazilianPhoneDigits(customerPhone) || String(from || '');
 }
@@ -974,12 +1381,12 @@ function getFallbackSessionKey(from) {
 
 async function resolveCustomerPhone(message) {
   try {
-    const contact = await message.getContact();
+    const contact = await withTimeout(message.getContact(), config.whatsappOperationTimeoutMs, 'message.getContact');
     const contactPhone = extractPhoneFromContact(contact);
     if (contactPhone) return contactPhone;
 
     if (contact && typeof contact.getFormattedNumber === 'function') {
-      const formattedPhone = extractBrazilianPhoneDigits(await contact.getFormattedNumber());
+      const formattedPhone = extractBrazilianPhoneDigits(await withTimeout(contact.getFormattedNumber(), config.whatsappOperationTimeoutMs, 'contact.getFormattedNumber'));
       if (formattedPhone) return formattedPhone;
     }
   } catch (error) {
@@ -997,12 +1404,12 @@ async function resolveCustomerPhone(message) {
 
 async function resolvePhoneForChatId(chatId) {
   try {
-    const contact = await client.getContactById(chatId);
+    const contact = await withTimeout(client.getContactById(chatId), config.whatsappOperationTimeoutMs, 'client.getContactById');
     const contactPhone = extractPhoneFromContact(contact);
     if (contactPhone) return contactPhone;
 
     if (contact && typeof contact.getFormattedNumber === 'function') {
-      const formattedPhone = extractBrazilianPhoneDigits(await contact.getFormattedNumber());
+      const formattedPhone = extractBrazilianPhoneDigits(await withTimeout(contact.getFormattedNumber(), config.whatsappOperationTimeoutMs, 'contact.getFormattedNumber'));
       if (formattedPhone) return formattedPhone;
     }
   } catch (error) {
@@ -1030,7 +1437,7 @@ async function resolvePhoneFromWhatsAppId(chatId) {
   if (typeof client.getContactLidAndPhone !== 'function') return '';
 
   try {
-    const results = await client.getContactLidAndPhone([chatId]);
+    const results = await withTimeout(client.getContactLidAndPhone([chatId]), config.whatsappOperationTimeoutMs, 'client.getContactLidAndPhone');
     const first = Array.isArray(results) ? results[0] : results;
     const phone = extractBrazilianPhoneDigits(first && first.pn);
 
@@ -1101,7 +1508,7 @@ async function resolveAdminChatId() {
   }
 
   try {
-    const resolved = await client.getNumberId(digits);
+    const resolved = await withTimeout(client.getNumberId(digits), config.whatsappOperationTimeoutMs, 'client.getNumberId');
     if (resolved && resolved._serialized) {
       logger.info('Admin WhatsApp number resolved', {
         adminChatId: resolved._serialized
@@ -1128,7 +1535,7 @@ async function sendAdminMessage(text) {
   }
 
   try {
-    return await client.sendMessage(adminChatId, text);
+    return await withTimeout(client.sendMessage(adminChatId, text), config.whatsappOperationTimeoutMs, 'client.sendMessage(admin)');
   } catch (error) {
     if (!isWhatsAppLidError(error)) throw error;
 
@@ -1140,7 +1547,7 @@ async function sendAdminMessage(text) {
     const refreshedAdminChatId = await resolveAdminChatId();
     if (refreshedAdminChatId && refreshedAdminChatId !== adminChatId) {
       adminChatId = refreshedAdminChatId;
-      return await client.sendMessage(adminChatId, text);
+      return await withTimeout(client.sendMessage(adminChatId, text), config.whatsappOperationTimeoutMs, 'client.sendMessage(admin retry)');
     }
 
     adminChatId = '';
@@ -1157,9 +1564,10 @@ function isWhatsAppLidError(error) {
 
 async function sendCustomerReply(message, text) {
   if (!text) return null;
+  if (!message || !message.from) return null;
 
   rememberBotOutgoing(message.from, text);
-  return await message.reply(text, undefined, { sendSeen: false });
+  return await withTimeout(message.reply(text, undefined, { sendSeen: false }), config.whatsappOperationTimeoutMs, 'message.reply');
 }
 
 async function sendFactoryVideo(message) {
@@ -1170,9 +1578,20 @@ async function sendFactoryVideo(message) {
     : path.join(process.cwd(), config.factoryVideoPath);
 
   if (!fs.existsSync(videoPath)) {
-    logger.warn('Factory video was configured but the file was not found. Put the file at ./media/company-presentation.mp4 on the VPS host, mounted as /app/media/company-presentation.mp4 in Docker.', {
+    logger.warn('Factory video was configured but the file was not found. Put the file at ./media/forte-lajes-fabrica.mp4 on the VPS host, mounted as /app/media/forte-lajes-fabrica.mp4 in Docker.', {
       configuredFactoryVideoPath: config.factoryVideoPath,
       resolvedFactoryVideoPath: videoPath
+    });
+    return null;
+  }
+
+  const stats = fs.statSync(videoPath);
+  if (config.maxFactoryVideoBytes > 0 && stats.size > config.maxFactoryVideoBytes) {
+    logger.warn('Factory video skipped because it is larger than the configured limit', {
+      configuredFactoryVideoPath: config.factoryVideoPath,
+      resolvedFactoryVideoPath: videoPath,
+      sizeBytes: stats.size,
+      maxFactoryVideoBytes: config.maxFactoryVideoBytes
     });
     return null;
   }
@@ -1181,10 +1600,10 @@ async function sendFactoryVideo(message) {
   const caption = config.factoryVideoCaption || '';
   rememberBotOutgoing(message.from, caption);
 
-  return await client.sendMessage(message.from, media, {
+  return await withTimeout(client.sendMessage(message.from, media, {
     ...(caption ? { caption } : {}),
     sendSeen: false
-  });
+  }), config.whatsappOperationTimeoutMs, 'client.sendMessage(media)');
 }
 
 async function sendFactoryVideoForResult(message, result) {
@@ -1219,7 +1638,7 @@ async function markCustomerChatUnreadAfterBotReply(message, reason) {
   }
 
   try {
-    await client.markChatUnread(chatId);
+    await withTimeout(client.markChatUnread(chatId), config.whatsappOperationTimeoutMs, 'client.markChatUnread');
     logger.info('Customer chat marked unread after bot automatic reply', {
       chatId,
       reason
@@ -1275,6 +1694,18 @@ function isGroupMessage(chatId) {
   return String(chatId || '').endsWith('@g.us');
 }
 
+function isSystemBroadcastMessage(message) {
+  const candidates = [
+    message && message.from,
+    message && message.to,
+    message && message.id && message.id.remote,
+    message && message._data && message._data.from,
+    message && message._data && message._data.to
+  ];
+
+  return candidates.some((candidate) => String(candidate || '').endsWith('@broadcast'));
+}
+
 function isAudioMessage(message) {
   const type = String(message.type || '').toLowerCase();
   return Boolean(message.hasMedia && (type === 'audio' || type === 'ptt' || type === 'voice'));
@@ -1296,6 +1727,7 @@ function formatNewVisitAlert(visit) {
     `Cliente: ${visit.client_name}`,
     `Dia da visita: ${formatDateBr(visit.visit_date)}`,
     `Bairro/região: ${visit.neighborhood || visit.address || 'Não informado'}`,
+    ...formatVisitAddressLines(visit),
     `WhatsApp: ${formatBrazilianPhoneNumber(visit.client_phone)}`,
     `Horário: ${visit.visit_time || 'A combinar'}`,
     ...formatVisitNoteLines(visit),
@@ -1315,6 +1747,7 @@ function formatWeeklyVisits(visits, startDate, endDate) {
     `Dia da visita: ${formatDateBr(visit.visit_date)}`,
     `Horário: ${visit.visit_time || 'A combinar'}`,
     `Bairro/região: ${visit.neighborhood || visit.address || 'Não informado'}`,
+    ...formatVisitAddressLines(visit),
     `WhatsApp: ${formatBrazilianPhoneNumber(visit.client_phone)}`,
     ...formatVisitNoteLines(visit)
   ].join('\n'));
@@ -1325,6 +1758,14 @@ function formatWeeklyVisits(visits, startDate, endDate) {
 function formatVisitNoteLines(visit) {
   const notes = String(visit && visit.notes ? visit.notes : '').trim();
   return notes ? [`Observações: ${notes}`] : [];
+}
+
+function formatVisitAddressLines(visit) {
+  const address = String(visit && visit.address ? visit.address : '').trim();
+  const neighborhood = String(visit && visit.neighborhood ? visit.neighborhood : '').trim();
+
+  if (!address || address === neighborhood) return [];
+  return [`Endereço/local: ${address}`];
 }
 
 function formatDateBr(dateKey) {
@@ -1349,13 +1790,85 @@ function parseNonNegativeInteger(value, fallback) {
   return Math.floor(parsed);
 }
 
+function parsePositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function parseMultilineEnv(value, fallback) {
+  const text = String(value || '').trim();
+  if (!text) return fallback;
+  return text.replace(/\\n/g, '\n');
+}
+
 function parsePort(value, fallback) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) return fallback;
   return parsed;
 }
 
+function withTimeout(promise, timeoutMs, label) {
+  let timer = null;
+
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
+function startWhatsAppWatchdog() {
+  if (whatsappWatchdogTimer || config.whatsappWatchdogIntervalMs <= 0) return;
+
+  whatsappWatchdogTimer = setInterval(() => {
+    checkWhatsAppHealth().catch((error) => {
+      logger.warn('WhatsApp watchdog check failed unexpectedly', { error });
+    });
+  }, config.whatsappWatchdogIntervalMs);
+
+  if (typeof whatsappWatchdogTimer.unref === 'function') {
+    whatsappWatchdogTimer.unref();
+  }
+}
+
+async function checkWhatsAppHealth() {
+  if (!whatsappReady) return;
+
+  try {
+    const state = typeof client.getState === 'function'
+      ? await withTimeout(client.getState(), config.whatsappWatchdogTimeoutMs, 'client.getState')
+      : 'UNKNOWN';
+
+    if (['CONFLICT', 'TIMEOUT', 'UNPAIRED', 'UNPAIRED_IDLE'].includes(String(state || '').toUpperCase())) {
+      throw new Error(`WhatsApp state is ${state}`);
+    }
+
+    whatsappWatchdogFailures = 0;
+  } catch (error) {
+    whatsappWatchdogFailures += 1;
+    logger.warn('WhatsApp watchdog failure', {
+      failures: whatsappWatchdogFailures,
+      maxFailures: config.whatsappWatchdogMaxFailures,
+      error
+    });
+
+    if (whatsappWatchdogFailures >= config.whatsappWatchdogMaxFailures) {
+      logger.error('WhatsApp watchdog failure limit reached; exiting for Docker restart', {
+        failures: whatsappWatchdogFailures
+      });
+      process.exit(1);
+    }
+  }
+}
+
 async function safeReply(message, text) {
+  if (!message) return;
+
   try {
     const sentReply = await sendCustomerReply(message, text);
     if (sentReply) {
@@ -1373,6 +1886,7 @@ async function shutdown(signal) {
   logger.info('Shutdown requested', { signal });
 
   if (cronController) cronController.stopAll();
+  if (whatsappWatchdogTimer) clearInterval(whatsappWatchdogTimer);
   for (const entry of pendingCustomerMessages.values()) {
     clearTimeout(entry.timer);
   }
@@ -1424,7 +1938,9 @@ logger.info('Starting WhatsApp bot', {
   cronTimezone: config.cronTimezone,
   customerReplyDelayMs: config.customerReplyDelayMs,
   customerFollowUpReplyDelayMs: config.customerFollowUpReplyDelayMs,
+  customerAiAssistantEnabled: config.customerAiAssistantEnabled,
   factoryVideoConfigured: Boolean(config.factoryVideoPath),
+  audioTranscription: getAudioTranscriptionInfo(),
   ai: getAiServiceInfo()
 });
 
@@ -1443,7 +1959,7 @@ function logFactoryVideoConfiguration() {
     : path.join(process.cwd(), config.factoryVideoPath);
 
   if (!fs.existsSync(videoPath)) {
-    logger.warn('Factory video file is missing. On the VPS, store it at /opt/whatsapp-scheduling/media/company-presentation.mp4 and keep FACTORY_VIDEO_PATH=/app/media/company-presentation.mp4.', {
+    logger.warn('Factory video file is missing. On the VPS, store it at /opt/whatsapp-bot/media/forte-lajes-fabrica.mp4 and keep FACTORY_VIDEO_PATH=/app/media/forte-lajes-fabrica.mp4.', {
       configuredFactoryVideoPath: config.factoryVideoPath,
       resolvedFactoryVideoPath: videoPath
     });
@@ -1476,6 +1992,20 @@ function startHealthServer() {
       status: 'ok',
       service: 'whatsapp-scheduling-bot',
       aiProvider: getAiProviderLabel(),
+      customerAiAssistant: {
+        enabled: config.customerAiAssistantEnabled
+      },
+      audioTranscription: getAudioTranscriptionInfo(),
+      botLoop: {
+        windowMs: config.botLoopWindowMs,
+        maxAutoReplies: config.botLoopMaxAutoReplies,
+        trackedContacts: automaticReplyHistory.size
+      },
+      whatsappReady,
+      watchdogFailures: whatsappWatchdogFailures,
+      pendingCustomers: pendingCustomerMessages.size,
+      sessionCacheEntries: sessionManager.getCacheSize(),
+      startedAt,
       uptimeSeconds: Math.floor(process.uptime())
     }, headersOnly);
   });
@@ -1516,6 +2046,7 @@ async function startWhatsAppClient() {
   try {
     await client.initialize();
   } catch (error) {
+    whatsappReady = false;
     logger.error('WhatsApp client initialization failed', { error });
 
     if (config.cleanupChromiumProfileLocks && isChromiumProfileLockError(error)) {

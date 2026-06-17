@@ -182,6 +182,7 @@ function formatReminderMessage({ title, targetDate, visits, taskType }) {
   const lines = visits.map((visit, index) => [
     `${index + 1}. ${visit.visit_time || 'A combinar'} - ${visit.client_name}`,
     `   Bairro/região: ${visit.neighborhood || visit.address || 'Não informado'}`,
+    ...formatVisitAddressLines(visit),
     `   WhatsApp: ${formatBrazilianPhoneNumber(visit.client_phone)}`,
     `   Protocolo: #${visit.id}`,
     ...formatVisitNoteLines(visit)
@@ -193,6 +194,14 @@ function formatReminderMessage({ title, targetDate, visits, taskType }) {
 function formatVisitNoteLines(visit) {
   const notes = String(visit && visit.notes ? visit.notes : '').trim();
   return notes ? [`   Observações: ${notes}`] : [];
+}
+
+function formatVisitAddressLines(visit) {
+  const address = String(visit && visit.address ? visit.address : '').trim();
+  const neighborhood = String(visit && visit.neighborhood ? visit.neighborhood : '').trim();
+
+  if (!address || address === neighborhood) return [];
+  return [`   Endereço/local: ${address}`];
 }
 
 function formatDateBr(dateKey) {

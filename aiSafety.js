@@ -72,7 +72,7 @@ function wrapUntrustedUserContent(input) {
 }
 
 function validateAiResponse(output) {
-  const original = String(output || '').trim();
+  const original = stripAiReasoning(output);
   if (!original) {
     return {
       ok: true,
@@ -102,8 +102,35 @@ function validateAiResponse(output) {
   };
 }
 
+function stripAiReasoning(output) {
+  let text = String(output || '');
+
+  const pairedReasoningBlocks = [
+    /<think>[\s\S]*?<\/think>/gi,
+    /<thinking>[\s\S]*?<\/thinking>/gi,
+    /\[think\][\s\S]*?\[\/think\]/gi,
+    /\[thinking\][\s\S]*?\[\/thinking\]/gi,
+    /\|think\|[\s\S]*?\|\/think\|/gi,
+    /\|thinking\|[\s\S]*?\|\/thinking\|/gi
+  ];
+
+  for (const pattern of pairedReasoningBlocks) {
+    text = text.replace(pattern, '');
+  }
+
+  text = text.replace(/^\s*(?:<\/?think>|<\/?thinking>|\[\/?think(?:ing)?\]|\|\/?think(?:ing)?\|)\s*$/gim, '');
+
+  const unclosedReasoningMarker = text.search(/<think>|\[think\]|\|think\||<thinking>|\[thinking\]|\|thinking\|/i);
+  if (unclosedReasoningMarker !== -1) {
+    text = text.slice(0, unclosedReasoningMarker);
+  }
+
+  return text.trim();
+}
+
 module.exports = {
   analyzePromptInjectionRisk,
+  stripAiReasoning,
   validateAiResponse,
   wrapUntrustedUserContent
 };

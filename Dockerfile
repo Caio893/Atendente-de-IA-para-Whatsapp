@@ -33,6 +33,7 @@ RUN apt-get update \
         chromium \
         ca-certificates \
         dumb-init \
+        ffmpeg \
         fonts-liberation \
         libasound2 \
         libatk-bridge2.0-0 \
@@ -59,13 +60,15 @@ COPY --chown=node:node package*.json ./
 COPY --chown=node:node *.js ./
 COPY --chown=node:node aiProviders ./aiProviders
 
-RUN mkdir -p /app/data /app/.wwebjs_auth /app/media \
+RUN mkdir -p /app/data /app/.wwebjs_auth /app/media /app/models \
     && chown -R node:node /app
 
 USER node
 
-VOLUME ["/app/data", "/app/.wwebjs_auth", "/app/media"]
+VOLUME ["/app/data", "/app/.wwebjs_auth", "/app/media", "/app/models"]
 
 EXPOSE 3001
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 CMD node -e "require('http').get('http://127.0.0.1:' + (process.env.PORT || 3001) + '/health', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 
 CMD ["dumb-init", "node", "index.js"]

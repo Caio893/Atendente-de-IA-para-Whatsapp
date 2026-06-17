@@ -4,6 +4,12 @@ services:
     build: .
     container_name: whatsapp-scheduling-bot
     restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: ${WHATSAPP_BOT_MEM_LIMIT:-1800m}
+    memswap_limit: ${WHATSAPP_BOT_MEMSWAP_LIMIT:-2200m}
+    cpus: "${WHATSAPP_BOT_CPUS:-1.0}"
+    pids_limit: ${WHATSAPP_BOT_PIDS_LIMIT:-200}
+    shm_size: ${WHATSAPP_BOT_SHM_SIZE:-256m}
     env_file:
       - .env
     environment:
@@ -17,6 +23,8 @@ services:
       - ./data:/app/data
       - ./.wwebjs_auth:/app/.wwebjs_auth
       - ./media:/app/media:ro
+      - ./models:/app/models:ro
+      - ./bin:/app/bin:ro
     healthcheck:
       test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:' + (process.env.PORT || 3001) + '/health', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
       interval: 30s
